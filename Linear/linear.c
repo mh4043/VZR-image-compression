@@ -4,23 +4,37 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image.h"
-#include "stb_image_write.h"
+#include "../packages/stb_image.h"
+#include "../packages/stb_image_write.h"
 
-void k_means_clustering(char *image_original, int width, int height, int cpp, int clusters, int iterations) {
+int width, height, cpp; // Image qualities
+unsigned char *image_original;
+
+// Function parameters
+char* image_file;
+int number_of_clusters, number_of_iterations;
+
+
+// Initialize cluster coordinates - pixel X and Y
+void init_clusters(char init_clusters[number_of_clusters][cpp]) {
+    for (int i = 0; i < number_of_clusters; i++) {
+        int random_pixel_w = (i * width) / number_of_clusters;
+        int random_pixel_h = (i * height) / number_of_clusters;
+
+        for (int j = 0; j < cpp; j++) {
+            init_clusters[i][j] = image_original[(random_pixel_h * width + random_pixel_w) * cpp + j];
+        }
+        //printf("Init cluster %d\n", i);
+    }
+}
+
+
+void k_means_clustering(char *image_original,char clusters_centroids[number_of_clusters][cpp]) {
     // init an array of cluster centroids by assigning them random observations
-    char clusters_centroids[clusters][cpp];  // array of centroids of clusters which hold pixels as arrays ([R, G, B, A])
     int random_pixel_w, random_pixel_h;
     printf("Starting cluster initalization\n");
     fflush(stdout);
 
-    for (int i = 0; i < clusters; i++) {
-        random_pixel_w = rand() % width;
-        random_pixel_h = rand() % height;
-        for (int j = 0; j < cpp; j++) {
-            clusters_centroids[i][j] = image_original[(random_pixel_h * width + random_pixel_w) * cpp + j];
-        }
-    }
     printf("Clusters initialized\n");
     fflush(stdout);
 
@@ -30,7 +44,7 @@ void k_means_clustering(char *image_original, int width, int height, int cpp, in
     printf("Pixel centroids initialized with size %d\n", width*height);
     fflush(stdout);
     
-    for (int iter = 0; iter < iterations; iter++) {
+    for (int iter = 0; iter < number_of_iterations; iter++) {
         printf("Iteration %d...\n", iter);
         fflush(stdout);
         for (int pxl = 0; pxl < width * height; pxl++) {
@@ -39,7 +53,7 @@ void k_means_clustering(char *image_original, int width, int height, int cpp, in
             char pxl_blue = image_original[pxl * cpp + 2];
             float min_dst = 513;  // minimum distance from pixel to centroid
             int min_indx = 0;     // centroid index with min distance to pixel
-            for (int centroid = 0; centroid < clusters; centroid++) {
+            for (int centroid = 0; centroid < number_of_clusters; centroid++) {
                 char cntr_red = clusters_centroids[centroid][0];
                 char cntr_green = clusters_centroids[centroid][1];
                 char cntr_blue = clusters_centroids[centroid][2];
@@ -59,19 +73,43 @@ void k_means_clustering(char *image_original, int width, int height, int cpp, in
         printf("POU ITERACIJE\n");
         fflush(stdout);
 
-        for (int centroid = 0; centroid < clusters; centroid++) {
+        for (int centroid = 0; centroid < number_of_clusters; centroid++) {
             int sum_red = 0;
             int sum_green = 0;
             int sum_blue = 0;
             int count = 0;
             for (int pxl = 0; pxl < width * height; pxl++) {
                 if (pixel_centroids[pxl] == centroid) {
-                    sum_red += image_original[pxl * cpp];
-                    sum_green += image_original[pxl * cpp + 1];
-                    sum_blue += image_original[pxl * cpp + 2];
+                    sum_red += (int)image_original[pxl * cpp];
+                    sum_green += (int)image_original[pxl * cpp + 1];
+                    sum_blue += (int)image_original[pxl * cpp + 2];
                     count += 1;
                 }
             }
+            if (!count) {
+                printf("Cluster %d has no pixels that belong to it\n", centroid);
+                fflush(stdout);
+
+                // Assign a random pixel to the cluster
+                random_pixel_w = rand() % width;
+                random_pixel_h = rand() % height;
+
+                clusters_centroids[centroid][0] = image_original[(random_pixel_h * width + random_pixel_w) * cpp];
+                clusters_centroids[centroid][1] = image_original[(random_pixel_h * width + random_pixel_w) * cpp + 1];
+                clusters_centroids[centroid][2] = image_original[(random_pixel_h * width + random_pixel_w) * cpp + 2];
+
+                pixel_centroids[random_pixel_h * width + random_pixel_w] = centroid;
+
+                // Increase the count and colors 
+                sum_red += (int)image_original[(random_pixel_h * width + random_pixel_w) * cpp];
+                sum_green += (int)image_original[(random_pixel_h * width + random_pixel_w) * cpp + 1];
+                sum_blue += (int)image_original[(random_pixel_h * width + random_pixel_w) * cpp + 2];
+                count += 1;
+
+                printf("Assigning random pixel to the cluster: %d\n", random_pixel_h * width + random_pixel_w);
+            }
+            //printf("NewRed %d, NewGreen %d, NewBlue %d, Count %d\n", sum_red, sum_green, sum_blue, count);
+            //fflush(stdout);
             int red = sum_red / count;
             int green = sum_green / count;
             int blue = sum_blue / count;
@@ -87,13 +125,11 @@ void k_means_clustering(char *image_original, int width, int height, int cpp, in
         image_original[i * cpp + 1] = clusters_centroids[pixel_centroids[i]][1];
         image_original[i * cpp + 2] = clusters_centroids[pixel_centroids[i]][2];
     }
+    printf("KNN Clustering done\n");
+    fflush(stdout);
 }
 
 int main(int argc, char *argv[]) {
-    char *image_file;
-    int number_of_clusters;  // = targeted number of colors
-    int number_of_iterations;
-
     srand(time(NULL));
 
     if (argc > 3) {
@@ -108,27 +144,30 @@ int main(int argc, char *argv[]) {
 
     printf("Starting program with parameters %s, %d, %d\n", image_file, number_of_clusters, number_of_iterations);
     fflush(stdout);
-    int width, height, cpp;  // image width, image height, image cpp = channels per pixel (4)
-    unsigned char *image_original = stbi_load(image_file, &width, &height, &cpp, 0);
+    image_original = stbi_load(image_file, &width, &height, &cpp, 0);
 
     if (image_original) {
         printf("Image loaded with dimensions: %d %d %d\n", width, height, cpp);
         fflush(stdout);
-        k_means_clustering(image_original, width, height, cpp, number_of_clusters, number_of_iterations);
 
+        // Init clusters
+        char clusters[number_of_clusters][cpp];
+        init_clusters(clusters);
+
+        k_means_clustering(image_original, clusters);
+
+        char output[] = "output_compressed";
         if (cpp == 3) {
-            char *newImageFileName = "output_compressed.jpg";
-            strcat(image_file, "_compressed.jpg");
-            printf("newImageFileName %s\n", newImageFileName);
-            stbi_write_jpg(newImageFileName,
+            strcat(output, ".jpg");
+            printf("%s", output);
+            stbi_write_jpg(output,
                            width, height, cpp, image_original, 100);  // channelsPer Pixel = comp channels of data per channel: 1=Y, 2=YA, 3=RGB, 4=RGBA
         }
         if (cpp == 4) {
-            char *newImageFileName = "output_compressed.png";
-            printf("newImageFileName %s\n", newImageFileName);
+            strcat(output, ".png");
+            printf("%s", output);
             int stride_in_bytes = width * cpp;
-            printf("stride_in_bytes %d\n", stride_in_bytes);
-            stbi_write_png(newImageFileName,
+            stbi_write_png(output,
                            width, height, cpp, image_original, stride_in_bytes);
         }
     } else {
