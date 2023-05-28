@@ -23,86 +23,122 @@ int number_of_clusters, number_of_iterations;
 
 #define BINS 256
 #define UNIFIED_MEMORY
-#define THREADS_PER_BLOCK (1024)
+#define THREADS_PER_BLOCK (256)
 
-__global__ void kmeans_clustering(
+__device__ int get_closest_cluster(unsigned char *pixel, int number_of_clusters, unsigned int *clusters, int cpp) {
+    // Iterate number of clusters, check which one is closest in terms of euclidean distance of RGB
+    char pxl_red = pixel[0];
+    char pxl_green = pixel[1];
+    char pxl_blue = pixel[2];
+    float min_dst = 1000;  // minimum distance from pixel to centroid
+    int min_indx = 0;      // centroid index with min distance to pixel
+    for (int centroid = 0; centroid < number_of_clusters; centroid++) {
+        char cntr_red = clusters[centroid * cpp + 0];
+        char cntr_green = clusters[centroid * cpp + 1];
+        char cntr_blue = clusters[centroid * cpp + 2];
+
+        // Calculate Eucledeianean distance
+        char delta_red = pxl_red - cntr_red;
+        char delta_green = pxl_green - cntr_green;
+        char delta_blue = pxl_blue - cntr_blue;
+        float dst = sqrtf(powf(delta_red, 2) + powf(delta_green, 2) + powf(delta_blue, 2));
+        if (dst < min_dst) {
+            min_dst = dst;
+            min_indx = centroid;
+        }
+    }
+    return min_indx;
+}
+
+__global__ void fill_closest_clusters(
     unsigned char *image,
     unsigned int *clusters,
-    int *cluster_counts,
     int *cluster_assignments,
     int number_of_clusters,
     int width,
     int height,
-    int cpp,
-    int iterations) {
+    int cpp) {
     // Get thread id
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    for (int iteration = 0; iteration < iterations; iteration++) {
-        // Get pixel
-        unsigned char *pixel = &image[tid * cpp];
 
-        // Find closest cluster with euclidean distance
-        int closest_cluster = -1;
-        int closest_distance = 999999999;
+    // Get pixel
+    /*
 
-        for (int i = 0; i < number_of_clusters; i++) {
-            int distance = 0;
-            for (int j = 0; j < cpp; j++) {
-                distance += (pixel[j] - clusters[i * cpp + j]) * (pixel[j] - clusters[i * cpp + j]);
-            }
-            if (distance < closest_distance) {
-                closest_distance = distance;
-                closest_cluster = i;
-            }
-        }
+    unsigned char *pixel = &image[tid * cpp];
+    */
 
-        // Assign pixel to cluster
-        cluster_assignments[tid] = closest_cluster;
+    unsigned char pixel_red = image[tid * cpp + 0];
+    unsigned char pixel_green = image[tid * cpp + 1];
+    unsigned char pixel_blue = image[tid * cpp + 2];
+    unsigned char pixel[3] = {pixel_red, pixel_green, pixel_blue};
 
-        // Add pixel to cluster count
-        atomicAdd(&cluster_counts[closest_cluster], 1);
+    // Assign pixel to cluster
+    cluster_assignments[tid] = get_closest_cluster(pixel, number_of_clusters, clusters, cpp);
+}
 
-        // Add pixel to cluster sum
-        for (int i = 0; i < cpp; i++) {
-            atomicAdd(&clusters[closest_cluster * cpp + i], pixel[i]);
-        }
+__global__ void update_centroids(unsigned char *image,
+                                 unsigned int *clusters,
+                                 int *cluster_assignments,
+                                 int number_of_clusters,
+                                 int width, int height, int cpp) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-        // Sync threads
-        __syncthreads();
+    int block_tid = threadIdx.x;
 
-        if (tid < number_of_clusters) {
-            /*
-            // Check if cluster is empty - add the next closest pixel
-            if (cluster_counts[tid] == 0) {
-                int closest_distance = 999999999;
-                int closest_pixel = -1;
-                for (int j = 0; j < width * height; j++) {
-                    int distance = 0;
-                    for (int k = 0; k < cpp; k++) {
-                        distance += (image[j * cpp + k] - clusters[tid * cpp + k]) * (image[j * cpp + k] - clusters[tid * cpp + k]);
-                    }
-                    if (distance < closest_distance) {
-                        closest_distance = distance;
-                        closest_pixel = j;
-                    }
-                }
-                for (int j = 0; j < cpp; j++) {
-                    clusters[tid * cpp + j] = image[closest_pixel * cpp + j];
-                }
-            }
-            */
+    // Create shared memory
+    __shared__ unsigned char shared_image[THREADS_PER_BLOCK * 3];
+    for (int j = 0; j < cpp; j++) 
+        shared_image[block_tid *cpp + j] = image[tid * cpp + j];
 
-            for (int j = 0; j < cpp; j++) {
-                //if (cluster_counts[tid] == 0)
-                    //printf("Cluster %d has no count\n", tid);
-                clusters[tid * cpp + j] = clusters[tid * cpp + j] / cluster_counts[tid];
-            }
-        }
-        __syncthreads();
-    }
+    // Save cluster assignments to shared memory
+    __shared__ int cluster_assignments_shared[THREADS_PER_BLOCK];
+    cluster_assignments_shared[block_tid] = cluster_assignments[tid];
 
-    // Sync threads
+    // Wait for all threads to finish
     __syncthreads();
+
+    // If block_tid is 0, then we are in the first thread of the block, so we can do the reduction
+    if (block_tid == 0) {
+        // Cluster counts - count how many pixels have cluster[i] as closest, store in shared memory, define size as number_of_clusters
+        int cluster_counts_shared[THREADS_PER_BLOCK] = {0};
+
+        // Cluster centroids - sum all pixels that have cluster[i] as closest, store in shared memory, define size as number_of_clusters * cpp
+        unsigned int clusters_shared[THREADS_PER_BLOCK * 3] = {0};
+
+        // Iterate over all threads
+        for (int i = 0; i < THREADS_PER_BLOCK; i++) {
+            // Get cluster assignment
+            int cluster_assignment = cluster_assignments_shared[i];
+            // Increment cluster count
+            cluster_counts_shared[cluster_assignment] += 1;
+            // Increment cluster centroid
+            for (int j = 0; j < cpp; j++) 
+                clusters_shared[cluster_assignment * cpp + j] += shared_image[i *cpp + j];
+        }
+
+        // Normalize cluster centroids
+        for (int i = 0; i < number_of_clusters; i++) {
+            for (int j = 0; j < cpp; j++) {
+                clusters_shared[i * cpp + j] /= cluster_counts_shared[i];
+            }
+        }
+
+        // Save cluster counts to global memory
+        for (int i = 0; i < number_of_clusters; i++) {
+            cluster_assignments[i] = cluster_counts_shared[i];
+        }
+    }
+    // Wait for all threads to finish
+    __syncthreads();
+
+    if (tid < number_of_clusters) {
+        clusters[tid] /= cluster_assignments[tid];
+    }
+}
+
+__global__ void save_images(unsigned char *image, unsigned int *clusters, int *cluster_assignments, int cpp) {
+    // Get thread id
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Save image
     for (int j = 0; j < cpp; j++) {
@@ -128,12 +164,12 @@ int main(int argc, char *argv[]) {
     image_original = stbi_load(image_file, &width, &height, &cpp, 0);
 
     if (image_original) {
-// Define Thread number
-#define SIZE (width * height)
+        // Define Thread number
+        #define SIZE (width * height)
 
         // Thread organization
         dim3 blockSize(THREADS_PER_BLOCK);
-        dim3 gridSize((SIZE) / blockSize.x);
+        dim3 gridSize((SIZE + blockSize.x - 1) / blockSize.x);
 
         printf("Image loaded with dimensions: %d %d %d\n", width, height, cpp);
         fflush(stdout);
@@ -147,7 +183,7 @@ int main(int argc, char *argv[]) {
             for (int j = 0; j < cpp; j++) {
                 clusters_centroids[i * cpp + j] = image_original[(random_pixel_h * width + random_pixel_w) * cpp + j];
             }
-            printf("X and Y for cluster: %d, %d, \n", random_pixel_w, random_pixel_h);
+            // printf("X and Y for cluster: %d, %d, \n", random_pixel_w, random_pixel_h);
         }
 
         // Init cluster assignments, use malloc
@@ -158,26 +194,26 @@ int main(int argc, char *argv[]) {
 
         // Copy image to device
         unsigned char *image_device;
-        checkCudaErrors(cudaMalloc((void **)&image_device, SIZE * cpp * sizeof(unsigned char)));
+        checkCudaErrors(cudaMalloc(&image_device, SIZE * cpp * sizeof(unsigned char)));
         checkCudaErrors(cudaMemcpy(image_device, image_original, SIZE * cpp * sizeof(unsigned char), cudaMemcpyHostToDevice));
         getLastCudaError("cudaMemcpy image_original failed");
 
         // Copy clusters to device as 1D array
         unsigned int *clusters_device;
-        checkCudaErrors(cudaMalloc((void **)&clusters_device, number_of_clusters * cpp * sizeof(unsigned int)));
-        checkCudaErrors(cudaMemcpy(clusters_device, clusters_centroids, number_of_clusters * cpp * sizeof(unsigned char), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMalloc(&clusters_device, number_of_clusters * cpp * sizeof(unsigned int)));
+        checkCudaErrors(cudaMemcpy(clusters_device, clusters_centroids, number_of_clusters * cpp * sizeof(unsigned int), cudaMemcpyHostToDevice));
         getLastCudaError("cudaMemcpy clusters_centroids failed");
 
         // Copy cluster counts to device
         int *cluster_counts_device;
-        checkCudaErrors(cudaMalloc((void **)&cluster_counts_device, number_of_clusters * sizeof(int)));
+        checkCudaErrors(cudaMalloc(&cluster_counts_device, number_of_clusters * sizeof(int)));
         checkCudaErrors(cudaMemcpy(cluster_counts_device, cluster_counts, number_of_clusters * sizeof(int), cudaMemcpyHostToDevice));
         getLastCudaError("cudaMemcpy cluster_counts failed");
 
         // Copy cluster assignments to device
         int *cluster_assignments_device;
-        checkCudaErrors(cudaMalloc((void **)&cluster_assignments_device, SIZE * sizeof(unsigned int)));
-        checkCudaErrors(cudaMemcpy(cluster_assignments_device, cluster_assignments, SIZE * sizeof(unsigned int), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMalloc(&cluster_assignments_device, SIZE * sizeof(int)));
+        checkCudaErrors(cudaMemcpy(cluster_assignments_device, cluster_assignments, SIZE * sizeof(int), cudaMemcpyHostToDevice));
         getLastCudaError("cudaMemcpy cluster_assignments failed");
 
         cudaEvent_t start, stop;
@@ -186,17 +222,42 @@ int main(int argc, char *argv[]) {
         cudaEventCreate(&stop);
         cudaEventRecord(start);
 
-        // Assign each pixel to a cluster
-        kmeans_clustering<<<gridSize, blockSize>>>(
-            image_device,
-            clusters_device,
-            cluster_counts_device,
-            cluster_assignments_device,
-            number_of_clusters,
-            width,
-            height,
-            cpp,
-            number_of_iterations);
+        for (int iter = 0; iter < number_of_iterations; iter++) {
+            // Assign each pixel to a cluster
+            fill_closest_clusters<<<gridSize, blockSize>>>(image_device,
+                                                           clusters_device,
+                                                           cluster_assignments_device,
+                                                           number_of_clusters,
+                                                           width,
+                                                           height,
+                                                           cpp);
+
+            // Update centroids
+            update_centroids<<<gridSize, blockSize>>>(image_device,
+                                                      clusters_device,
+                                                      cluster_assignments_device,
+                                                      number_of_clusters,
+                                                      width,
+                                                      height,
+                                                      cpp);
+
+            /*
+            // Do the clustering
+            kmeans_clustering<<<gridSize, blockSize>>>(
+                image_device,
+                clusters_device,
+                cluster_counts_device,
+                cluster_assignments_device,
+                number_of_clusters,
+                width,
+                height,
+                cpp,
+                number_of_iterations);
+                */
+        }
+        // Save image
+        save_images<<<gridSize, blockSize>>>(image_device, clusters_device, cluster_assignments_device, cpp);
+
         getLastCudaError("kmeans_clustering failed");
 
         cudaEventRecord(stop);
