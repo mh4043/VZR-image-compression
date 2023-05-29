@@ -23,25 +23,26 @@ int number_of_clusters, number_of_iterations;
 
 #define BINS 256
 #define UNIFIED_MEMORY
-#define THREADS_PER_BLOCK (256)
+#define THREADS_PER_BLOCK 256
 
 __device__ int get_closest_cluster(unsigned char *pixel, int number_of_clusters, unsigned int *clusters, int cpp) {
     // Iterate number of clusters, check which one is closest in terms of euclidean distance of RGB
-    char pxl_red = pixel[0];
-    char pxl_green = pixel[1];
-    char pxl_blue = pixel[2];
     float min_dst = 1000;  // minimum distance from pixel to centroid
     int min_indx = 0;      // centroid index with min distance to pixel
     for (int centroid = 0; centroid < number_of_clusters; centroid++) {
-        char cntr_red = clusters[centroid * cpp + 0];
-        char cntr_green = clusters[centroid * cpp + 1];
-        char cntr_blue = clusters[centroid * cpp + 2];
+        float dst = 0.0;
 
-        // Calculate Eucledeianean distance
-        char delta_red = pxl_red - cntr_red;
-        char delta_green = pxl_green - cntr_green;
-        char delta_blue = pxl_blue - cntr_blue;
-        float dst = sqrtf(powf(delta_red, 2) + powf(delta_green, 2) + powf(delta_blue, 2));
+        // Iterate cpp to get RGB values, accumulate distance
+        for (int j = 0; j < cpp; j++) {
+            char cntr = clusters[centroid * cpp + j];
+            char delta = pixel[j] - cntr;
+            dst += powf(delta, 2);
+        }
+
+        // Get euclidean distance
+        dst = sqrtf(dst);
+
+        // Check if distance is smaller than min_dst
         if (dst < min_dst) {
             min_dst = dst;
             min_indx = centroid;
@@ -58,19 +59,13 @@ __global__ void fill_closest_clusters(
     int width,
     int height,
     int cpp) {
+
     // Get thread id
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Get pixel
-    /*
 
     unsigned char *pixel = &image[tid * cpp];
-    */
-
-    unsigned char pixel_red = image[tid * cpp + 0];
-    unsigned char pixel_green = image[tid * cpp + 1];
-    unsigned char pixel_blue = image[tid * cpp + 2];
-    unsigned char pixel[3] = {pixel_red, pixel_green, pixel_blue};
 
     // Assign pixel to cluster
     cluster_assignments[tid] = get_closest_cluster(pixel, number_of_clusters, clusters, cpp);
@@ -84,9 +79,12 @@ __global__ void update_centroids(unsigned char *image,
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     int block_tid = threadIdx.x;
-
+    
+    __shared__ unsigned char shared_image[THREADS_PER_BLOCK * 4];
     // Create shared memory
-    __shared__ unsigned char shared_image[THREADS_PER_BLOCK * 3];
+    if (cpp == 3)
+        __shared__ unsigned char shared_image[THREADS_PER_BLOCK * 3];
+    
     for (int j = 0; j < cpp; j++) 
         shared_image[block_tid *cpp + j] = image[tid * cpp + j];
 
@@ -103,7 +101,10 @@ __global__ void update_centroids(unsigned char *image,
         int cluster_counts_shared[THREADS_PER_BLOCK] = {0};
 
         // Cluster centroids - sum all pixels that have cluster[i] as closest, store in shared memory, define size as number_of_clusters * cpp
-        unsigned int clusters_shared[THREADS_PER_BLOCK * 3] = {0};
+        unsigned int clusters_shared[THREADS_PER_BLOCK * 4] = {0};
+        if (cpp == 3)
+            unsigned int clusters_shared[THREADS_PER_BLOCK * 3] = {0};
+
 
         // Iterate over all threads
         for (int i = 0; i < THREADS_PER_BLOCK; i++) {
@@ -114,13 +115,6 @@ __global__ void update_centroids(unsigned char *image,
             // Increment cluster centroid
             for (int j = 0; j < cpp; j++) 
                 clusters_shared[cluster_assignment * cpp + j] += shared_image[i *cpp + j];
-        }
-
-        // Normalize cluster centroids
-        for (int i = 0; i < number_of_clusters; i++) {
-            for (int j = 0; j < cpp; j++) {
-                clusters_shared[i * cpp + j] /= cluster_counts_shared[i];
-            }
         }
 
         // Save cluster counts to global memory
@@ -159,7 +153,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("Starting program with parameters %s, %d, %d\n", image_file, number_of_clusters, number_of_iterations);
     fflush(stdout);
     image_original = stbi_load(image_file, &width, &height, &cpp, 0);
 
@@ -171,7 +164,9 @@ int main(int argc, char *argv[]) {
         dim3 blockSize(THREADS_PER_BLOCK);
         dim3 gridSize((SIZE + blockSize.x - 1) / blockSize.x);
 
-        printf("Image loaded with dimensions: %d %d %d\n", width, height, cpp);
+        printf("Image size: %d, Image width: %d, Image height: %d, Image channels: %d, Number of clusters: %d, Number of iterations: %d\n", SIZE, width, height, cpp, number_of_clusters, number_of_iterations);
+        fflush(stdout);
+        printf("Block size: %d, Grid size: %d\n", blockSize.x, gridSize.x);
         fflush(stdout);
 
         // Init clusters as 1D array
@@ -183,7 +178,6 @@ int main(int argc, char *argv[]) {
             for (int j = 0; j < cpp; j++) {
                 clusters_centroids[i * cpp + j] = image_original[(random_pixel_h * width + random_pixel_w) * cpp + j];
             }
-            // printf("X and Y for cluster: %d, %d, \n", random_pixel_w, random_pixel_h);
         }
 
         // Init cluster assignments, use malloc
@@ -241,19 +235,6 @@ int main(int argc, char *argv[]) {
                                                       height,
                                                       cpp);
 
-            /*
-            // Do the clustering
-            kmeans_clustering<<<gridSize, blockSize>>>(
-                image_device,
-                clusters_device,
-                cluster_counts_device,
-                cluster_assignments_device,
-                number_of_clusters,
-                width,
-                height,
-                cpp,
-                number_of_iterations);
-                */
         }
         // Save image
         save_images<<<gridSize, blockSize>>>(image_device, clusters_device, cluster_assignments_device, cpp);
@@ -278,12 +259,9 @@ int main(int argc, char *argv[]) {
         checkCudaErrors(cudaMemcpy(image_original, image_device, SIZE * cpp * sizeof(unsigned char), cudaMemcpyDeviceToHost));
         getLastCudaError("cudaMemcpy image_original failed");
 
-        char output[] = "output_compressed";
         if (cpp == 3) {
-            strcat(output, ".jpg");
-            printf("%s", output);
             // Check if the image was written
-            if (stbi_write_jpg(output,
+            if (stbi_write_jpg("compressed_image.jpg",
                                width, height, cpp, image_original, 100)) {
                 printf("Image written successfully\n");
             } else {
@@ -291,11 +269,9 @@ int main(int argc, char *argv[]) {
             }
         }
         if (cpp == 4) {
-            strcat(output, ".png");
-            printf("%s", output);
             int stride_in_bytes = width * cpp;
             // Check if the image was written
-            if (stbi_write_png(output,
+            if (stbi_write_png("compressed_image.png",
                                width, height, cpp, image_original, stride_in_bytes)) {
                 printf("Image written successfully\n");
             } else {
