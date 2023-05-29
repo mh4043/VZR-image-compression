@@ -70,7 +70,7 @@ void k_means_clustering(char *image_original,char clusters_centroids[number_of_c
             }
             pixel_centroids[pxl] = min_indx;
         }
-        printf("POU ITERACIJE\n");
+        printf("Computing mean values...\n");
         fflush(stdout);
 
         for (int centroid = 0; centroid < number_of_clusters; centroid++) {
